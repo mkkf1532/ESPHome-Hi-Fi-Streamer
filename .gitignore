@@ -1,0 +1,9 @@
+.esphome/
+build/
+secrets.yaml
+*.bak*
+*.bin
+*.elf
+.DS_Store
+Thumbs.db
+

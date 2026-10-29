@@ -1,0 +1,1286 @@
+# ==============================================================================
+# Project: Hi-Fi Network Audio Streamer & Cyber HUD (ESP32-S3 + PCM5102A + ST7789)
+# Author:  Maciej_Kow
+# Version: 1.0.0
+# License: MIT
+# ==============================================================================
+# First-Time Setup (Wi-Fi Provisioning):
+# After flashing, the device automatically creates an open Wi-Fi Hotspot:
+# SSID: "HiFi-Streamer-Setup"
+# Connect to it using your phone or PC — a Captive Portal page will open
+# automatically (or visit http://192.168.4.1) to select your Wi-Fi network.
+# ==============================================================================
+
+substitutions:
+  device_name: "hifi-streamer"
+  friendly_name: "Hi-Fi Streamer"
+
+  # Home Assistant & Music Assistant network configuration (Album Art & DSP EQ)
+  ha_ip: "192.168.1.100"
+  ha_port: "8123"
+  ma_port: "8095"
+  ma_token: "Bearer YOUR_MUSIC_ASSISTANT_TOKEN"
+  ma_player_entity: "media_player.hifi_streamer"
+  ma_dsp_player_id: "media_player.hifi_streamer"
+
+  # Optional outdoor temperature entity from Home Assistant
+  # (used as a fallback if no DS18B20 probe is connected to GPIO40)
+  outdoor_temp_entity: "sensor.outdoor_temperature"
+
+  # Onboard environmental sensor pins on the main ESP32-S3
+  i2c_sda_pin: "GPIO41"     # I2C SDA (AHT20 + BMP280)
+  i2c_scl_pin: "GPIO42"     # I2C SCL (AHT20 + BMP280)
+  onewire_pin: "GPIO40"     # 1-Wire data pin (external DS18B20 probe)
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  project:
+    name: Maciej_Kow.HiFi_Streamer
+    version: "1.0.0"
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    priority: -100
+    then:
+      - delay: 350ms
+      - lambda: |-
+          if (id(streamer_player).volume >= 0.30f) {
+            id(vol_target) = id(streamer_player).volume;
+          } else {
+            id(vol_target) = 0.50f;
+          }
+      - if:
+          condition:
+            binary_sensor.is_on: power_switch
+          then:
+            - script.execute: apply_power_on
+          else:
+            - script.execute: apply_power_off
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+
+# 8MB Octal PSRAM @ 80MHz (for ESP32-S3 N16R8 modules)
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  baud_rate: 0
+  level: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+# ==============================================================================
+# 0. WI-FI HOTSPOT & CAPTIVE PORTAL (ZERO-CONFIG PROVISIONING)
+# ==============================================================================
+wifi:
+  min_auth_mode: WPA2
+  power_save_mode: none
+  ap:
+    ssid: "HiFi-Streamer-Setup"
+
+captive_portal:
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+http_request:
+  verify_ssl: false
+  timeout: 5s
+
+globals:
+  - id: has_album_art
+    type: bool
+    initial_value: 'false'
+  - id: last_art_url
+    type: std::string
+    initial_value: '""'
+  - id: current_screen
+    type: int
+    initial_value: '0'   # 0 = Spotify / Now Playing, 1 = Weather / Temperatures
+  - id: bg_cur_top_r
+    type: float
+    initial_value: '24.0'
+  - id: bg_cur_top_g
+    type: float
+    initial_value: '30.0'
+  - id: bg_cur_top_b
+    type: float
+    initial_value: '46.0'
+  - id: bg_target_top_r
+    type: float
+    initial_value: '24.0'
+  - id: bg_target_top_g
+    type: float
+    initial_value: '30.0'
+  - id: bg_target_top_b
+    type: float
+    initial_value: '46.0'
+
+  - id: bg_cur_bot_r
+    type: float
+    initial_value: '14.0'
+  - id: bg_cur_bot_g
+    type: float
+    initial_value: '18.0'
+  - id: bg_cur_bot_b
+    type: float
+    initial_value: '28.0'
+  - id: bg_target_bot_r
+    type: float
+    initial_value: '14.0'
+  - id: bg_target_bot_g
+    type: float
+    initial_value: '18.0'
+  - id: bg_target_bot_b
+    type: float
+    initial_value: '28.0'
+  - id: cover_anim
+    type: float
+    initial_value: '1.0'
+  - id: active_art_idx
+    type: int
+    initial_value: '0'
+  - id: target_art_idx
+    type: int
+    initial_value: '0'
+  - id: art_transition
+    type: float
+    initial_value: '1.0'
+
+  # Volume accumulator in RAM for instant (0 ms lag) rotary encoder response
+  - id: vol_target
+    type: float
+    initial_value: '0.50'
+  - id: vol_dirty
+    type: bool
+    initial_value: 'false'
+  - id: last_enc_ms
+    type: uint32_t
+    initial_value: '0'
+
+# Dynamic double-buffered album art (128x128 px) in PSRAM with smooth crossfade
+image:
+  - platform: online_image
+    id: album_art_0
+    url: "http://${ha_ip}:${ha_port}/static/icons/favicon.ico"
+    format: JPEG
+    type: RGB565
+    resize: 128x128
+    update_interval: never
+    on_download_finished:
+      - lambda: |-
+          if (id(target_art_idx) == 0) {
+            id(art_transition) = 0.0f;
+            id(cover_anim) = 0.0f;
+          }
+
+  - platform: online_image
+    id: album_art_1
+    url: "http://${ha_ip}:${ha_port}/static/icons/favicon.ico"
+    format: JPEG
+    type: RGB565
+    resize: 128x128
+    update_interval: never
+    on_download_finished:
+      - lambda: |-
+          if (id(target_art_idx) == 1) {
+            id(art_transition) = 0.0f;
+            id(cover_anim) = 0.0f;
+          }
+
+# ==============================================================================
+# 1. HARDWARE BUSES: SPI (ST7789), I2S (PCM5102A), I2C (AHT20/BMP280), 1-Wire
+# ==============================================================================
+spi:
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  interface: hardware
+
+i2c:
+  sda: ${i2c_sda_pin}
+  scl: ${i2c_scl_pin}
+  scan: true
+  frequency: 100kHz
+
+one_wire:
+  - platform: gpio
+    pin: ${onewire_pin}
+    id: onewire_bus
+
+i2s_audio:
+  - id: i2s_out
+    i2s_lrclk_pin: GPIO16   # DAC LCK / WS
+    i2s_bclk_pin: GPIO15    # DAC BCK
+
+speaker:
+  # 1. Physical I2S output to external PCM5102A DAC
+  - platform: i2s_audio
+    id: dac_physical_speaker
+    i2s_audio_id: i2s_out
+    dac_type: external
+    i2s_dout_pin: GPIO17    # DAC DIN
+    channel: stereo
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    timeout: never
+
+  # 2. Hardware mixer: seamless playback of music, TTS announcements, and Sendspin
+  - platform: mixer
+    id: dac_mixer
+    output_speaker: dac_physical_speaker
+    source_speakers:
+      - id: spk_media_in          # Main music pipeline
+        buffer_duration: 250ms
+        timeout: never
+      - id: spk_announcement_in   # TTS / Announcements pipeline
+        buffer_duration: 500ms
+        timeout: 500ms
+      - id: spk_sendspin_in       # Synchronized Sendspin multi-room pipeline
+        buffer_duration: 250ms
+        timeout: never
+
+# ==============================================================================
+# SENDSPIN PROTOCOL: MILLISECOND-ACCURATE MULTI-ROOM SYNCHRONIZATION
+# ==============================================================================
+sendspin:
+
+media_source:
+  - platform: sendspin
+    id: sendspin_source
+    initial_static_delay: 0ms
+    static_delay_adjustable: true
+
+media_player:
+  - platform: speaker
+    id: streamer_player
+    name: "Hi-Fi Streamer"
+    # Main audio pipeline (Music Assistant / FLAC / PCM)
+    media_pipeline:
+      speaker: spk_media_in
+      format: NONE
+      num_channels: 2
+    # Announcement pipeline (Home Assistant TTS / Chimes)
+    announcement_pipeline:
+      speaker: spk_announcement_in
+      format: NONE
+      num_channels: 2
+    buffer_size: 350000     # ~350 KB in PSRAM (~0.95s PCM)
+    volume_increment: 0.014
+    on_volume:
+      - lambda: |-
+          if (millis() - id(last_enc_ms) > 250) {
+            id(vol_target) = x;
+          }
+    on_play:
+      - if:
+          condition:
+            not:
+              binary_sensor.is_on: power_switch
+          then:
+            - media_player.stop: streamer_player
+          else:
+            - light.turn_on:
+                id: led_blue
+                brightness: 20%
+    on_idle:
+      - light.turn_off: led_blue
+
+  # Sendspin player for multi-room synchronization
+  - platform: speaker_source
+    id: sendspin_player
+    name: "Sendspin Streamer"
+    media_pipeline:
+      speaker: spk_sendspin_in
+      sources:
+        - sendspin_source
+    volume_increment: 0.014
+    on_play:
+      - if:
+          condition:
+            not:
+              binary_sensor.is_on: power_switch
+          then:
+            - media_player.stop: sendspin_player
+          else:
+            - light.turn_on:
+                id: led_blue
+                brightness: 20%
+    on_idle:
+      - if:
+          condition:
+            lambda: |-
+              return id(streamer_player).state != media_player::MEDIA_PLAYER_STATE_PLAYING;
+          then:
+            - light.turn_off: led_blue
+
+  # Sendspin Group entity in Home Assistant / Music Assistant
+  - platform: sendspin
+    name: "Sendspin Group"
+
+
+# ==============================================================================
+# 2. DISPLAY BACKLIGHT (PWM 0-100% -> 30-100% HW) & RGB STATUS LED
+# ==============================================================================
+output:
+  - platform: ledc
+    pin: GPIO13
+    id: tft_backlight_pwm
+    frequency: 25000Hz  # Ultrasonic 25 kHz PWM - eliminates coil whine
+
+  # Slider mapping: 0% gives 0% hardware PWM (zero glow), >0% scales 30-100%
+  - platform: template
+    id: tft_backlight_mapped
+    type: float
+    write_action:
+      - lambda: |-
+          if (state <= 0.001f) {
+            id(tft_backlight_pwm).set_level(0.0f);
+          } else {
+            float hw_level = 0.30f + state * 0.70f;
+            id(tft_backlight_pwm).set_level(hw_level);
+          }
+
+  # Status RGB LED (G=GPIO8, R=GPIO18, B=GPIO21)
+  - platform: ledc
+    pin: GPIO8
+    id: out_led_green
+  - platform: ledc
+    pin: GPIO18
+    id: out_led_red
+  - platform: ledc
+    pin: GPIO21
+    id: out_led_blue
+
+light:
+  - platform: monochromatic
+    output: tft_backlight_mapped
+    name: "Display Backlight"
+    id: tft_backlight
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 0s
+    gamma_correct: 0.0
+
+  - platform: monochromatic
+    output: out_led_green
+    id: led_green
+    internal: true
+  - platform: monochromatic
+    output: out_led_red
+    id: led_red
+    internal: true
+  - platform: monochromatic
+    output: out_led_blue
+    id: led_blue
+    internal: true
+
+
+# ==============================================================================
+# 3. POWER TOGGLE SWITCH (Soft-Standby) & ENCODER MULTI-CLICK BUTTON
+# ==============================================================================
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO7
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Power Toggle Switch"
+    id: power_switch
+    trigger_on_initial_state: true
+    filters:
+      - delayed_on_off: 50ms
+    on_press:
+      then:
+        - script.execute: apply_power_on
+    on_release:
+      then:
+        - script.execute: apply_power_off
+
+  - platform: gpio
+    pin:
+      number: GPIO6
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    name: "Encoder Button"
+    id: encoder_button
+    filters:
+      - delayed_on: 8ms
+      - delayed_off: 8ms
+    on_multi_click:
+      # Long press (Hold > 450ms) -> Toggle active screen (when powered ON)
+      - timing:
+          - ON for at least 450ms
+        then:
+          - if:
+              condition:
+                binary_sensor.is_on: power_switch
+              then:
+                - logger.log: "Encoder hold: Toggle screen"
+                - lambda: |-
+                    id(current_screen) = (id(current_screen) == 0) ? 1 : 0;
+                - light.turn_on:
+                    id: led_blue
+                    brightness: 25%
+                - delay: 80ms
+                - if:
+                    condition:
+                      lambda: |-
+                        return (id(streamer_player).state != media_player::MEDIA_PLAYER_STATE_PLAYING && id(ma_player_state).state != "playing");
+                    then:
+                      - light.turn_off: led_blue
+
+      # Double click -> Next track (Skip track)
+      - timing:
+          - ON for at most 280ms
+          - OFF for at most 220ms
+          - ON for at most 280ms
+          - OFF for at least 20ms
+        then:
+          - logger.log: "Encoder double-click: Next track"
+          - if:
+              condition:
+                binary_sensor.is_on: power_switch
+              then:
+                - homeassistant.service:
+                    service: media_player.media_next_track
+                    data:
+                      entity_id: ${ma_player_entity}
+
+      # Single click -> Play/Pause when ON, Toggle backlight when in Standby
+      - timing:
+          - ON for at most 300ms
+          - OFF for at least 150ms
+        then:
+          - if:
+              condition:
+                binary_sensor.is_on: power_switch
+              then:
+                - logger.log: "Encoder single-click: Play/Pause"
+                - if:
+                    condition:
+                      lambda: |-
+                        return (id(streamer_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING || id(ma_player_state).state == "playing");
+                    then:
+                      - media_player.pause: streamer_player
+                      - homeassistant.service:
+                          service: media_player.media_pause
+                          data:
+                            entity_id: ${ma_player_entity}
+                    else:
+                      - media_player.play: streamer_player
+                      - homeassistant.service:
+                          service: media_player.media_play
+                          data:
+                            entity_id: ${ma_player_entity}
+              else:
+                - if:
+                    condition:
+                      lambda: |-
+                        return id(tft_backlight).current_values.is_on();
+                    then:
+                      - logger.log: "Standby: Turning display backlight OFF"
+                      - light.turn_off: tft_backlight
+                    else:
+                      - logger.log: "Standby: Waking display backlight to 70%"
+                      - light.turn_on:
+                          id: tft_backlight
+                          brightness: 70%
+
+# ==============================================================================
+# 3.5 DIRECT PARAMETRIC EQ DSP CONTROL (ESP32-S3 -> MUSIC ASSISTANT RPC API)
+# ==============================================================================
+script:
+  - id: apply_power_on
+    then:
+      - light.turn_off: led_red
+      - light.turn_on:
+          id: led_green
+          brightness: 12%
+      - globals.set:
+          id: current_screen
+          value: '0'
+      - light.turn_on:
+          id: tft_backlight
+          brightness: 100%
+      - lambda: |-
+          if (id(streamer_player).volume < 0.30f) {
+            id(vol_target) = 0.30f;
+            auto call = id(streamer_player).make_call();
+            call.set_volume(0.30f);
+            call.perform();
+          } else {
+            id(vol_target) = id(streamer_player).volume;
+          }
+      - script.execute: send_dsp_update
+
+  - id: apply_power_off
+    then:
+      - media_player.stop: streamer_player
+      - media_player.stop: sendspin_player
+      - homeassistant.service:
+          service: media_player.media_pause
+          data:
+            entity_id: ${ma_player_entity}
+      - light.turn_off: led_green
+      - light.turn_off: led_blue
+      - light.turn_on:
+          id: led_red
+          brightness: 15%
+      - globals.set:
+          id: current_screen
+          value: '1'
+      - light.turn_on:
+          id: tft_backlight
+          brightness: 70%
+
+  - id: send_dsp_update
+    mode: restart
+    then:
+      - delay: 600ms
+      - if:
+          condition:
+            - wifi.connected:
+            - binary_sensor.is_on: power_switch
+          then:
+            - http_request.post:
+                url: "http://${ha_ip}:${ma_port}/api"
+                request_headers:
+                  Content-Type: "application/json"
+                  Authorization: "${ma_token}"
+                body: !lambda |-
+                  float b = isnan(id(pot_bass).state) ? 0.0f : id(pot_bass).state;
+                  float t = isnan(id(pot_treble).state) ? 0.0f : id(pot_treble).state;
+                  bool dsp_on = (fabsf(b) >= 0.1f || fabsf(t) >= 0.1f);
+                  char buf[512];
+                  snprintf(buf, sizeof(buf),
+                    "{\"command\":\"config/players/dsp/save\",\"args\":{\"player_id\":\"${ma_dsp_player_id}\",\"config\":{\"enabled\":%s,\"filters\":[{\"enabled\":true,\"preamp\":0.0,\"per_channel_preamp\":{},\"type\":\"parametric_eq\",\"bands\":[{\"frequency\":60.0,\"q\":1.0,\"gain\":%.1f,\"type\":\"low_shelf\",\"enabled\":true,\"channel\":\"ALL\"},{\"frequency\":10000.0,\"q\":1.0,\"gain\":%.1f,\"type\":\"high_shelf\",\"enabled\":true,\"channel\":\"ALL\"}]}],\"input_gain\":0.0,\"output_gain\":0.0,\"preset_id\":null}}}",
+                    dsp_on ? "true" : "false", b, t
+                  );
+                  return std::string(buf);
+
+# ==============================================================================
+# 3.8 ENCODER VOLUME SYNCHRONIZATION (ZERO-LAG QUEUE COALESCING)
+# ==============================================================================
+interval:
+  - interval: 25ms
+    then:
+      - lambda: |-
+          if (id(vol_dirty)) {
+            id(vol_dirty) = false;
+            float target = id(vol_target);
+            auto call = id(streamer_player).make_call();
+            call.set_volume(target);
+            call.perform();
+            if (id(sendspin_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING) {
+              auto call_ss = id(sendspin_player).make_call();
+              call_ss.set_volume(target);
+              call_ss.perform();
+            }
+          }
+
+# ==============================================================================
+# 4. ROTARY ENCODER, EQ POTENTIOMETERS & ONBOARD ESP32-S3 SENSORS
+# ==============================================================================
+sensor:
+  # Rotary volume encoder with instant RAM accumulation and 3-stage velocity curve
+  - platform: rotary_encoder
+    name: "Volume Encoder"
+    id: volume_encoder
+    internal: true
+    restore_mode: ALWAYS_ZERO
+    pin_a:
+      number: GPIO4
+      mode:
+        input: true
+        pullup: true
+    pin_b:
+      number: GPIO5
+      mode:
+        input: true
+        pullup: true
+    resolution: 1
+    on_clockwise:
+      - lambda: |-
+          if (!id(power_switch).state) return;
+          uint32_t now = millis();
+          uint32_t dt = now - id(last_enc_ms);
+          id(last_enc_ms) = now;
+          float step = (dt < 40) ? 0.035f : ((dt < 85) ? 0.021f : 0.014f);
+          float v = id(vol_target) + step;
+          if (v > 1.0f) v = 1.0f;
+          id(vol_target) = v;
+          id(vol_dirty) = true;
+    on_anticlockwise:
+      - lambda: |-
+          if (!id(power_switch).state) return;
+          uint32_t now = millis();
+          uint32_t dt = now - id(last_enc_ms);
+          id(last_enc_ms) = now;
+          float step = (dt < 40) ? 0.035f : ((dt < 85) ? 0.021f : 0.014f);
+          float v = id(vol_target) - step;
+          if (v < 0.30f) v = 0.30f;
+          id(vol_target) = v;
+          id(vol_dirty) = true;
+
+  # Bass & Treble analog potentiometers (±6dB range, 0.5dB step)
+  - platform: adc
+    pin: GPIO2
+    name: "Bass EQ"
+    id: pot_bass
+    attenuation: 12db
+    update_interval: 150ms
+    unit_of_measurement: "dB"
+    accuracy_decimals: 1
+    filters:
+      - sliding_window_moving_average:
+          window_size: 7
+          send_every: 2
+      - calibrate_linear:
+          - 0.05 -> 6.0
+          - 1.72 -> 0.0
+          - 3.25 -> -6.0
+      - clamp:
+          min_value: -6.0
+          max_value: 6.0
+      - lambda: |-
+          if (fabsf(x) < 0.35f) return 0.0f;
+          return roundf(x * 2.0f) / 2.0f;
+      - delta: 0.25
+    on_value:
+      then:
+        - script.execute: send_dsp_update
+
+  - platform: adc
+    pin: GPIO3
+    name: "Treble EQ"
+    id: pot_treble
+    attenuation: 12db
+    update_interval: 150ms
+    unit_of_measurement: "dB"
+    accuracy_decimals: 1
+    filters:
+      - sliding_window_moving_average:
+          window_size: 7
+          send_every: 2
+      - calibrate_linear:
+          - 0.05 -> 6.0
+          - 1.72 -> 0.0
+          - 3.25 -> -6.0
+      - clamp:
+          min_value: -6.0
+          max_value: 6.0
+      - lambda: |-
+          if (fabsf(x) < 0.35f) return 0.0f;
+          return roundf(x * 2.0f) / 2.0f;
+      - delta: 0.25
+    on_value:
+      then:
+        - script.execute: send_dsp_update
+
+  # --- ONBOARD ENVIRONMENTAL SENSORS CONNECTED DIRECTLY TO ESP32-S3 ---
+  # 1. AHT20 (I2C 0x38): Room temperature and relative humidity
+  - platform: aht10
+    variant: AHT20
+    address: 0x38
+    temperature:
+      name: "Room Temperature (AHT20)"
+      id: room_temp
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: 5
+            send_every: 2
+    humidity:
+      name: "Room Humidity (AHT20)"
+      id: room_humidity
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: 5
+            send_every: 2
+    update_interval: 15s
+
+  # 2. BMP280 (I2C 0x77): Atmospheric pressure and reference temperature
+  - platform: bmp280_i2c
+    address: 0x77
+    temperature:
+      name: "Room Temperature (BMP280)"
+      id: room_temp_bmp280
+      accuracy_decimals: 1
+    pressure:
+      name: "Atmospheric Pressure"
+      id: atmospheric_pressure
+      accuracy_decimals: 1
+      filters:
+        - sliding_window_moving_average:
+            window_size: 5
+            send_every: 2
+    update_interval: 15s
+
+  # 3. DS18B20 (1-Wire): External temperature probe connected to ESP32-S3
+  - platform: dallas_temp
+    one_wire_id: onewire_bus
+    name: "Outdoor Temperature (DS18B20)"
+    id: outdoor_temp_ds18b20
+    accuracy_decimals: 1
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 2
+    update_interval: 15s
+
+  # ESP32-S3 internal core temperature
+  - platform: internal_temperature
+    name: "CPU Temperature"
+    id: cpu_temp
+    update_interval: 5s
+
+  # Wi-Fi diagnostic signal sensor
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    id: wifi_rssi
+    update_interval: 10s
+    entity_category: diagnostic
+
+  # Track duration and position from Home Assistant (Music Assistant)
+  - platform: homeassistant
+    id: media_duration
+    entity_id: ${ma_player_entity}
+    attribute: media_duration
+    internal: true
+
+  - platform: homeassistant
+    id: media_position
+    entity_id: ${ma_player_entity}
+    attribute: media_position
+    internal: true
+
+  # Optional outdoor temperature entity from Home Assistant (fallback when no DS18B20 is attached)
+  - platform: homeassistant
+    id: outdoor_temp_ha
+    entity_id: ${outdoor_temp_entity}
+    internal: true
+
+# ==============================================================================
+# 5. TEXT SENSORS: MEDIA METADATA, ALBUM ARTWORK & NETWORK DIAGNOSTICS
+# ==============================================================================
+text_sensor:
+  - platform: sendspin
+    type: title
+    name: "Sendspin Title"
+
+  - platform: sendspin
+    type: artist
+    name: "Sendspin Artist"
+
+  - platform: homeassistant
+    id: ma_player_state
+    entity_id: ${ma_player_entity}
+    internal: true
+
+  - platform: homeassistant
+    id: media_title
+    entity_id: ${ma_player_entity}
+    attribute: media_title
+    internal: true
+
+  - platform: homeassistant
+    id: media_artist
+    entity_id: ${ma_player_entity}
+    attribute: media_artist
+    internal: true
+
+  - platform: homeassistant
+    id: raw_entity_picture
+    entity_id: ${ma_player_entity}
+    attribute: entity_picture
+    internal: true
+    on_value:
+      then:
+        - lambda: |-
+            if (x.empty()) {
+              id(has_album_art) = false;
+              id(last_art_url) = "";
+              return;
+            }
+            std::string full_url = x;
+            if (x.rfind("http", 0) != 0) {
+              full_url = "http://${ha_ip}:${ha_port}" + x;
+            }
+            // Fetch 160px JPEG album artwork from Music Assistant / Home Assistant
+            size_t sz_pos = full_url.find("size=");
+            if (sz_pos != std::string::npos) {
+              size_t amp_pos = full_url.find('&', sz_pos);
+              if (amp_pos != std::string::npos) {
+                full_url.replace(sz_pos, amp_pos - sz_pos, "size=160");
+              } else {
+                full_url.replace(sz_pos, full_url.length() - sz_pos, "size=160");
+              }
+            } else {
+              full_url += (full_url.find('?') == std::string::npos ? "?size=160" : "&size=160");
+            }
+            size_t fmt_pos = full_url.find("fmt=png");
+            if (fmt_pos != std::string::npos) {
+              full_url.replace(fmt_pos, 7, "fmt=jpg");
+            }
+            if (full_url != id(last_art_url)) {
+              id(last_art_url) = full_url;
+              int next_idx = 1 - id(active_art_idx);
+              id(target_art_idx) = next_idx;
+              if (next_idx == 0) {
+                id(album_art_0)->set_url(full_url);
+                id(album_art_0)->update();
+              } else {
+                id(album_art_1)->set_url(full_url);
+                id(album_art_1)->update();
+              }
+              id(has_album_art) = true;
+            }
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+      id: wifi_ip
+      entity_category: diagnostic
+    ssid:
+      name: "WiFi SSID"
+      id: wifi_ssid_text
+      entity_category: diagnostic
+    bssid:
+      name: "WiFi BSSID"
+      entity_category: diagnostic
+    mac_address:
+      name: "MAC Address"
+      entity_category: diagnostic
+
+# ==============================================================================
+# 6. 2.8" TFT ST7789 DISPLAY (320x240) - CYBER HUD & AMBIENT UI
+# ==============================================================================
+font:
+  - file: "gfonts://JetBrains+Mono@700"
+    id: font_clock
+    size: 14
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ĄąĆćĘęŁłŃńÓóŚśŹźŻż"
+    ignore_missing_glyphs: true
+  - file: "gfonts://Montserrat@700"
+    id: font_big
+    size: 26
+    glyphs: " 0123456789:.-+°C%"
+    ignore_missing_glyphs: true
+  - file: "gfonts://Montserrat@700"
+    id: font_title
+    size: 14
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ĄąĆćĘęŁłŃńÓóŚśŹźŻż"
+    ignore_missing_glyphs: true
+  - file: "gfonts://Montserrat@500"
+    id: font_artist
+    size: 11
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ĄąĆćĘęŁłŃńÓóŚśŹźŻż"
+    ignore_missing_glyphs: true
+  - file: "gfonts://JetBrains+Mono@600"
+    id: font_hud
+    size: 11
+    glyphs: " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~ĄąĆćĘęŁłŃńÓóŚśŹźŻż°"
+    ignore_missing_glyphs: true
+
+color:
+  - id: c_black
+    hex: "000000"
+  - id: c_bg
+    hex: "0A0D14"
+  - id: c_card_bg
+    hex: "121824"
+  - id: c_card_border
+    hex: "1E293B"
+  - id: c_cyan
+    hex: "00F2FE"
+  - id: c_amber
+    hex: "FFB800"
+  - id: c_purple
+    hex: "9D4EDD"
+  - id: c_white
+    hex: "FFFFFF"
+  - id: c_subtle
+    hex: "2A3547"
+  - id: c_text_muted
+    hex: "8A99AD"
+
+display:
+  - platform: ili9xxx
+    model: ST7789V
+    cs_pin: GPIO10
+    dc_pin: GPIO9
+    reset_pin: GPIO14
+    dimensions:
+      height: 320
+      width: 240
+    rotation: 90
+    invert_colors: false
+    data_rate: 80MHz        # 80MHz Hardware SPI - 2x faster frame transfer, non-blocking encoder loop
+    update_interval: 40ms   # 25 FPS
+    lambda: |-
+      bool is_playing = (id(ma_player_state).state == "playing" || id(streamer_player).state == media_player::MEDIA_PLAYER_STATE_PLAYING);
+      bool is_paused = (id(ma_player_state).state == "paused");
+
+      float b_db = isnan(id(pot_bass).state) ? 0.0f : id(pot_bass).state;
+      float t_db = isnan(id(pot_treble).state) ? 0.0f : id(pot_treble).state;
+
+      // =========================================================================
+      // ACTIVE SCREEN SELECTION (0 = NOW PLAYING, 1 = WEATHER / TEMPERATURES)
+      // =========================================================================
+      if (!id(tft_backlight).current_values.is_on()) {
+        it.fill(Color(0, 0, 0));
+        return;
+      }
+      int active_screen = id(current_screen);
+      if (!id(power_switch).state) {
+        active_screen = 1;
+      }
+
+      if (active_screen == 0) {
+        // =========================================================================
+        // SCREEN 1: SPOTIFY / APPLE MUSIC "NOW PLAYING"
+        // =========================================================================
+        auto *img_prev = (id(active_art_idx) == 0) ? id(album_art_0) : id(album_art_1);
+        auto *img_next = (id(target_art_idx) == 0) ? id(album_art_0) : id(album_art_1);
+
+        bool show_prev = (id(has_album_art) && img_prev->is_loaded());
+        bool show_next = (id(has_album_art) && img_next->is_loaded());
+
+        auto *sample_art = (show_next && id(active_art_idx) != id(target_art_idx)) ? img_next : (show_prev ? img_prev : nullptr);
+        if (sample_art != nullptr && sample_art->is_loaded()) {
+          static std::string last_sampled_url = "";
+          if (last_sampled_url != id(last_art_url)) {
+            last_sampled_url = id(last_art_url);
+
+            float top_r = 0, top_g = 0, top_b = 0;
+            int top_samples = 0;
+            float bot_r = 0, bot_g = 0, bot_b = 0;
+            int bot_samples = 0;
+
+            int w = sample_art->get_width();
+            int h = sample_art->get_height();
+            if (w > 0 && h > 0) {
+              int mid_y = h / 2;
+              for (int sy = 8; sy < mid_y - 4; sy += 12) {
+                for (int sx = 8; sx < w - 8; sx += 14) {
+                  Color c = sample_art->get_pixel(sx, sy);
+                  top_r += c.r; top_g += c.g; top_b += c.b;
+                  top_samples++;
+                }
+              }
+              for (int sy = mid_y + 4; sy < h - 8; sy += 12) {
+                for (int sx = 8; sx < w - 8; sx += 14) {
+                  Color c = sample_art->get_pixel(sx, sy);
+                  bot_r += c.r; bot_g += c.g; bot_b += c.b;
+                  bot_samples++;
+                }
+              }
+            }
+
+            if (top_samples > 0) {
+              float ar = top_r / top_samples;
+              float ag = top_g / top_samples;
+              float ab = top_b / top_samples;
+              float mx = std::max({ar, ag, ab});
+              float scale = (mx > 10.0f) ? std::min(1.8f, 75.0f / mx) : 1.0f;
+              id(bg_target_top_r) = std::min(220.0f, ar * scale + 8.0f);
+              id(bg_target_top_g) = std::min(220.0f, ag * scale + 8.0f);
+              id(bg_target_top_b) = std::min(220.0f, ab * scale + 8.0f);
+            }
+            if (bot_samples > 0) {
+              float ar = bot_r / bot_samples;
+              float ag = bot_g / bot_samples;
+              float ab = bot_b / bot_samples;
+              float mx = std::max({ar, ag, ab});
+              float scale = (mx > 10.0f) ? std::min(1.8f, 70.0f / mx) : 1.0f;
+              id(bg_target_bot_r) = std::min(220.0f, ar * scale + 6.0f);
+              id(bg_target_bot_g) = std::min(220.0f, ag * scale + 6.0f);
+              id(bg_target_bot_b) = std::min(220.0f, ab * scale + 6.0f);
+            }
+          }
+        } else if (!id(has_album_art)) {
+          id(bg_target_top_r) = 22.0f;
+          id(bg_target_top_g) = 30.0f;
+          id(bg_target_top_b) = 46.0f;
+          id(bg_target_bot_r) = 14.0f;
+          id(bg_target_bot_g) = 18.0f;
+          id(bg_target_bot_b) = 28.0f;
+        }
+
+        // Smooth ambient background color interpolation (lerp)
+        id(bg_cur_top_r) += (id(bg_target_top_r) - id(bg_cur_top_r)) * 0.035f;
+        id(bg_cur_top_g) += (id(bg_target_top_g) - id(bg_cur_top_g)) * 0.035f;
+        id(bg_cur_top_b) += (id(bg_target_top_b) - id(bg_cur_top_b)) * 0.035f;
+
+        id(bg_cur_bot_r) += (id(bg_target_bot_r) - id(bg_cur_bot_r)) * 0.035f;
+        id(bg_cur_bot_g) += (id(bg_target_bot_g) - id(bg_cur_bot_g)) * 0.035f;
+        id(bg_cur_bot_b) += (id(bg_target_bot_b) - id(bg_cur_bot_b)) * 0.035f;
+
+        id(cover_anim) += (1.0f - id(cover_anim)) * 0.12f;
+
+        // Optimized 2-line strip gradient rendering
+        for (int y = 0; y < 240; y += 2) {
+          float factor = (float)y / 239.0f;
+          float curve = factor * factor * (3.0f - 2.0f * factor);
+          uint8_t r = (uint8_t)(id(bg_cur_top_r) + (id(bg_cur_bot_r) - id(bg_cur_top_r)) * curve);
+          uint8_t g = (uint8_t)(id(bg_cur_top_g) + (id(bg_cur_bot_g) - id(bg_cur_top_g)) * curve);
+          uint8_t b = (uint8_t)(id(bg_cur_top_b) + (id(bg_cur_bot_b) - id(bg_cur_top_b)) * curve);
+          it.filled_rectangle(0, y, 320, 2, Color(r, g, b));
+        }
+
+        // Luminance and contrast helper for adaptive foreground colors
+        auto get_contrast_for_y = [&](int y_pos) {
+          float f = (float)y_pos / 239.0f;
+          float c = f * f * (3.0f - 2.0f * f);
+          float r = id(bg_cur_top_r) + (id(bg_cur_bot_r) - id(bg_cur_top_r)) * c;
+          float g = id(bg_cur_top_g) + (id(bg_cur_bot_g) - id(bg_cur_top_g)) * c;
+          float b = id(bg_cur_top_b) + (id(bg_cur_bot_b) - id(bg_cur_top_b)) * c;
+          float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+          bool is_light = (lum > 145.0f);
+          Color fg_main = is_light ? Color(16, 20, 28) : Color(255, 255, 255);
+          Color fg_muted = is_light ? Color(65, 75, 90) : Color(185, 195, 210);
+          Color track = is_light ? Color(16, 20, 28, 45) : Color(255, 255, 255, 40);
+          return std::make_tuple(fg_main, fg_muted, track);
+        };
+
+        // 2. Top status bar (WiFi signal, CPU thermal warning, Clock)
+        auto [top_fg, top_muted, top_track] = get_contrast_for_y(6);
+        float rssi = id(wifi_rssi).state;
+        int bars = 0;
+        if (!isnan(rssi)) {
+          if (rssi >= -60.0f) bars = 4;
+          else if (rssi >= -70.0f) bars = 3;
+          else if (rssi >= -80.0f) bars = 2;
+          else if (rssi >= -90.0f) bars = 1;
+        }
+        it.filled_circle(25, 12, 2, (bars >= 1) ? top_fg : top_track);
+        Color w_c2 = (bars >= 2) ? top_fg : top_track;
+        it.horizontal_line(22, 8, 7, w_c2);
+        it.draw_pixel_at(21, 9, w_c2);
+        it.draw_pixel_at(29, 9, w_c2);
+        Color w_c3 = (bars >= 3) ? top_fg : top_track;
+        it.horizontal_line(19, 4, 13, w_c3);
+        it.draw_pixel_at(18, 5, w_c3);
+        it.draw_pixel_at(32, 5, w_c3);
+
+        float cpu_t = id(cpu_temp).state;
+        if (!isnan(cpu_t) && cpu_t >= 65.0f) {
+          it.printf(160, 2, id(font_hud), id(c_amber), TextAlign::TOP_CENTER, "CPU %.0f°C", cpu_t);
+        }
+
+        it.strftime(308, 4, id(font_clock), top_fg, TextAlign::TOP_RIGHT, "%H:%M", id(ha_time).now());
+
+        // 3. Volume bar - instant 0ms read from id(vol_target)
+        float raw_vol = id(vol_target);
+        float user_vol = (raw_vol - 0.30f) / 0.70f;
+        if (user_vol < 0.0f) user_vol = 0.0f;
+        if (user_vol > 1.0f) user_vol = 1.0f;
+        int vol_pct = (int)roundf(user_vol * 100.0f);
+
+        auto [v_fg, v_mut, v_trk] = get_contrast_for_y(101);
+        Color vol_base = v_fg;
+        Color vol_dimmed = v_trk;
+
+        it.printf(20, 37, id(font_hud), vol_base, TextAlign::TOP_CENTER, "VOL");
+        it.filled_rectangle(19, 53, 3, 96, vol_dimmed);
+        int v_h = (int)((vol_pct / 100.0f) * 96.0f);
+        if (v_h > 0) it.filled_rectangle(19, 149 - v_h, 3, v_h, vol_base);
+        it.filled_circle(20, 149 - v_h, 3, vol_base);
+        it.printf(20, 155, id(font_hud), vol_base, TextAlign::TOP_CENTER, "%d%%", vol_pct);
+
+        // 4. Floating borderless album cover with smooth crossfade
+        int art_y = (int)(18.0f + (1.0f - id(cover_anim)) * 6.0f);
+        if (show_next && !show_prev) {
+          id(active_art_idx) = id(target_art_idx);
+          id(art_transition) = 1.0f;
+          show_prev = true;
+          img_prev = img_next;
+        }
+
+        if (id(art_transition) < 1.0f && show_prev && show_next && id(active_art_idx) != id(target_art_idx)) {
+          id(art_transition) += 0.07f;
+          if (id(art_transition) >= 1.0f) {
+            id(art_transition) = 1.0f;
+            id(active_art_idx) = id(target_art_idx);
+          }
+          float t = id(art_transition);
+          float t_smooth = t * t * (3.0f - 2.0f * t);
+          int it_t = (int)(t_smooth * 256.0f);
+          int inv_t = 256 - it_t;
+
+          for (int py = 0; py < 128; ++py) {
+            for (int px = 0; px < 128; ++px) {
+              Color c0 = img_prev->get_pixel(px, py);
+              Color c1 = img_next->get_pixel(px, py);
+              uint8_t r = (uint8_t)((c0.r * inv_t + c1.r * it_t) >> 8);
+              uint8_t g = (uint8_t)((c0.g * inv_t + c1.g * it_t) >> 8);
+              uint8_t b = (uint8_t)((c0.b * inv_t + c1.b * it_t) >> 8);
+              it.draw_pixel_at(96 + px, art_y + py, Color(r, g, b));
+            }
+          }
+        } else if (show_prev) {
+          it.image(96, art_y, img_prev);
+        } else {
+          it.circle(160, 82, 44, top_track);
+          it.circle(160, 82, 28, top_muted);
+          it.circle(160, 82, 14, top_fg);
+          it.filled_circle(160, 82, 3, top_fg);
+        }
+
+        // 5. Track title and artist
+        auto [txt_fg, txt_muted, txt_trk] = get_contrast_for_y(160);
+        const std::string &title = id(media_title).state.empty() ? "Ready to Play" : id(media_title).state;
+        const std::string &artist = id(media_artist).state.empty() ? "Music Assistant" : id(media_artist).state;
+
+        if (title.length() > 24) {
+          int max_s = (int)title.length() - 21;
+          int cycle = (int)((millis() / 260) % (max_s + 6));
+          int offset = (cycle < 3) ? 0 : ((cycle > max_s + 3) ? max_s : cycle - 3);
+          it.printf(160, 152, id(font_title), txt_fg, TextAlign::TOP_CENTER, "%.22s", title.c_str() + offset);
+        } else {
+          it.printf(160, 152, id(font_title), txt_fg, TextAlign::TOP_CENTER, "%s", title.c_str());
+        }
+        it.printf(160, 168, id(font_artist), txt_muted, TextAlign::TOP_CENTER, "%.30s", artist.c_str());
+
+        // 6. Smooth progress bar with playback state icon
+        static uint32_t last_calc_ms = 0;
+        static float smooth_pos = 0.0f;
+        static float last_seen_pos = -1.0f;
+
+        float rep_pos = id(media_position).state;
+        if (isnan(rep_pos)) rep_pos = 0.0f;
+
+        uint32_t now_ms = millis();
+        if (rep_pos != last_seen_pos) {
+          last_seen_pos = rep_pos;
+          smooth_pos = rep_pos;
+          last_calc_ms = now_ms;
+        } else if (is_playing && (now_ms - last_calc_ms >= 40)) {
+          smooth_pos += (now_ms - last_calc_ms) / 1000.0f;
+          last_calc_ms = now_ms;
+        }
+
+        float dur = id(media_duration).state;
+        if (isnan(dur)) dur = 0.0f;
+        if (dur > 0.0f && smooth_pos > dur) smooth_pos = dur;
+
+        int cur_s = (int)smooth_pos;
+        int dur_s = (int)dur;
+
+        auto [bar_fg, bar_muted, bar_track] = get_contrast_for_y(190);
+
+        if (is_playing) {
+          for (int i = 0; i < 7; ++i) {
+            it.vertical_line(15 + i, 187 + (i + 1) / 2, 8 - (i / 2) * 2, bar_fg);
+          }
+        } else if (is_paused) {
+          it.filled_rectangle(15, 187, 2, 8, bar_fg);
+          it.filled_rectangle(19, 187, 2, 8, bar_fg);
+        } else {
+          it.filled_circle(17, 191, 2, bar_muted);
+        }
+
+        it.printf(27, 186, id(font_hud), bar_muted, "%02d:%02d", cur_s / 60, cur_s % 60);
+        if (dur_s > 0) {
+          it.printf(304, 186, id(font_hud), bar_muted, TextAlign::TOP_RIGHT, "%02d:%02d", dur_s / 60, dur_s % 60);
+        } else {
+          it.printf(304, 186, id(font_hud), bar_fg, TextAlign::TOP_RIGHT, "LIVE");
+        }
+
+        it.filled_rectangle(64, 190, 196, 3, bar_track);
+        if (dur_s > 0) {
+          float pct = smooth_pos / (float)dur_s;
+          if (pct > 1.0f) pct = 1.0f;
+          if (pct < 0.0f) pct = 0.0f;
+          int pw = (int)(pct * 196.0f);
+          if (pw > 0) it.filled_rectangle(64, 190, pw, 3, bar_fg);
+          it.filled_circle(64 + pw, 191, 3, bar_fg);
+        }
+
+        // 7. Bottom BASS and TREBLE indicators with adaptive contrast
+        auto [bt_fg, bt_muted, bt_track] = get_contrast_for_y(218);
+        Color bt_mark = (bt_fg == Color(255, 255, 255)) ? Color(255, 255, 255, 80) : Color(16, 20, 28, 90);
+
+        bool b_active = (fabsf(b_db) >= 0.1f);
+        Color b_col = b_active ? bt_fg : bt_muted;
+        it.printf(36, 206, id(font_hud), b_col, "BASS %+ddB", (int)roundf(b_db));
+        it.horizontal_line(36, 222, 108, bt_track);
+        it.vertical_line(90, 219, 6, bt_mark);
+        int b_dot = 90 + (int)roundf(b_db * 8.5f);
+        if (b_dot < 36) b_dot = 36;
+        if (b_dot > 144) b_dot = 144;
+        it.filled_circle(b_dot, 222, 3, b_col);
+
+        bool t_active = (fabsf(t_db) >= 0.1f);
+        Color t_col = t_active ? bt_fg : bt_muted;
+        it.printf(176, 206, id(font_hud), t_col, "TREBLE %+ddB", (int)roundf(t_db));
+        it.horizontal_line(176, 222, 108, bt_track);
+        it.vertical_line(230, 219, 6, bt_mark);
+        int t_dot = 230 + (int)roundf(t_db * 8.5f);
+        if (t_dot < 176) t_dot = 176;
+        if (t_dot > 284) t_dot = 284;
+        it.filled_circle(t_dot, 222, 3, t_col);
+
+      } else {
+        // =========================================================================
+        // SCREEN 2: STANDBY / WEATHER & TEMPERATURES (ONBOARD ESP32-S3 SENSORS)
+        // =========================================================================
+        it.fill(Color(0, 0, 0));
+
+        const Color petg_val(205, 212, 220);
+        const Color petg_clock(180, 186, 194);
+        const Color petg_lbl(125, 132, 140);
+
+        it.strftime(160, 36, id(font_big), petg_clock, TextAlign::TOP_CENTER, "%H:%M", id(ha_time).now());
+
+        // Room temperature from onboard AHT20 (fallback to onboard BMP280)
+        float r_temp = !isnan(id(room_temp).state) ? id(room_temp).state : id(room_temp_bmp280).state;
+        // Outdoor temperature from onboard DS18B20 (fallback to Home Assistant entity)
+        float out_temp = !isnan(id(outdoor_temp_ds18b20).state) ? id(outdoor_temp_ds18b20).state : id(outdoor_temp_ha).state;
+
+        // --- INDOOR (LEFT SIDE: X = 80) ---
+        it.printf(80, 110, id(font_title), petg_lbl, TextAlign::TOP_CENTER, "INDOOR");
+        if (!isnan(r_temp)) {
+          it.printf(80, 134, id(font_big), petg_val, TextAlign::TOP_CENTER, "%.1f°", r_temp);
+        } else {
+          it.printf(80, 134, id(font_big), petg_lbl, TextAlign::TOP_CENTER, "--.-°");
+        }
+
+        // --- OUTDOOR (RIGHT SIDE: X = 240) ---
+        it.printf(240, 110, id(font_title), petg_lbl, TextAlign::TOP_CENTER, "OUTDOOR");
+        if (!isnan(out_temp)) {
+          it.printf(240, 134, id(font_big), petg_val, TextAlign::TOP_CENTER, "%.1f°", out_temp);
+        } else {
+          it.printf(240, 134, id(font_big), petg_lbl, TextAlign::TOP_CENTER, "--.-°");
+        }
+
+        // Subtle humidity & atmospheric pressure status line (AHT20 + BMP280)
+        float r_hum = id(room_humidity).state;
+        float r_pres = id(atmospheric_pressure).state;
+        if (!isnan(r_hum) && !isnan(r_pres)) {
+          it.printf(160, 204, id(font_hud), petg_lbl, TextAlign::TOP_CENTER, "RH %.0f%%   |   %.0f hPa", r_hum, r_pres);
+        } else if (!isnan(r_hum)) {
+          it.printf(160, 204, id(font_hud), petg_lbl, TextAlign::TOP_CENTER, "HUMIDITY %.0f%%", r_hum);
+        }
+      }
