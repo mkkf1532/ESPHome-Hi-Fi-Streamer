@@ -571,10 +571,14 @@ script:
                   float b = isnan(id(pot_bass).state) ? 0.0f : id(pot_bass).state;
                   float t = isnan(id(pot_treble).state) ? 0.0f : id(pot_treble).state;
                   bool dsp_on = (fabsf(b) >= 0.1f || fabsf(t) >= 0.1f);
+                  float max_boost = 0.0f;
+                  if (b > max_boost) max_boost = b;
+                  if (t > max_boost) max_boost = t;
+                  float preamp = (max_boost > 0.0f) ? -max_boost : 0.0f;
                   char buf[512];
                   snprintf(buf, sizeof(buf),
-                    "{\"command\":\"config/players/dsp/save\",\"args\":{\"player_id\":\"${ma_dsp_player_id}\",\"config\":{\"enabled\":%s,\"filters\":[{\"enabled\":true,\"preamp\":0.0,\"per_channel_preamp\":{},\"type\":\"parametric_eq\",\"bands\":[{\"frequency\":60.0,\"q\":1.0,\"gain\":%.1f,\"type\":\"low_shelf\",\"enabled\":true,\"channel\":\"ALL\"},{\"frequency\":10000.0,\"q\":1.0,\"gain\":%.1f,\"type\":\"high_shelf\",\"enabled\":true,\"channel\":\"ALL\"}]}],\"input_gain\":0.0,\"output_gain\":0.0,\"preset_id\":null}}}",
-                    dsp_on ? "true" : "false", b, t
+                    "{\"command\":\"config/players/dsp/save\",\"args\":{\"player_id\":\"${ma_dsp_player_id}\",\"config\":{\"enabled\":%s,\"filters\":[{\"enabled\":true,\"preamp\":%.1f,\"per_channel_preamp\":{},\"type\":\"parametric_eq\",\"bands\":[{\"frequency\":60.0,\"q\":1.0,\"gain\":%.1f,\"type\":\"low_shelf\",\"enabled\":true,\"channel\":\"ALL\"},{\"frequency\":10000.0,\"q\":1.0,\"gain\":%.1f,\"type\":\"high_shelf\",\"enabled\":true,\"channel\":\"ALL\"}]}],\"input_gain\":0.0,\"output_gain\":0.0,\"preset_id\":null}}}",
+                    dsp_on ? "true" : "false", preamp, b, t
                   );
                   return std::string(buf);
 
